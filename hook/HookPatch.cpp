@@ -7,30 +7,41 @@
 #include <iostream>
 #include <cerrno>
 #include <Zydis/Zydis.h>
+#include <map>
 
 const size_t HookPatch::JUMP_SIZE = 14;
 
 thread_local HookPatch* g_currentHook = nullptr;
 
-void HookPatch::defaultLogger(const std::string& funcName, const std::vector<uint64_t>& args) {
-    std::cerr << "[HOOK] " << funcName << " called, args=" << args.size() << "\n";
+std::map<unsigned int, PatchInfo> patchedFunctions;
+
+HookController* HookController::hookController = nullptr;
+
+HookController* HookController::GetHookController() {
+    if (!hookController) {
+        hookController = new HookController(nullptr);
+    }
+    return hookController;
 }
 
-extern "C" uint64_t loggingWrapper_c(uint64_t* regs_buf, uint64_t nargs) {
-    if (!g_currentHook) return 0;
+HookPatch* HookController::GetHookPatch() {
+    return hookPatch;
+}
 
-    std::vector<uint64_t> args;
-    args.reserve(nargs > 6 ? 6 : nargs);
-    for (uint64_t i = 0; i < nargs && i < 6; ++i) {
-        args.push_back(regs_buf[i]);
-    }
+void HookPatch::defaultLogger(const std::string funcName) {
+    std::cerr << "[HOOK] " << funcName << "\n";
+}
+
+extern "C" uint64_t loggingWrapper_c(unsigned int id) {
+    std::cout << id << std::endl;
+    auto info = patchedFunctions[id];
 
     try {
-        g_currentHook->logCallback_(g_currentHook->functionName_, args);
+        HookPatch::defaultLogger(std::string(info.functionName));
     } catch (...) {
     }
 
-    void* tramp = g_currentHook->getTrampolineAddr();
+    void* tramp = info.trampoline.code;
     return reinterpret_cast<uint64_t>(tramp);
 }
 
@@ -46,8 +57,7 @@ extern "C" void asm_wrapper() {
         "mov QWORD PTR [rsp + 32], r8\n"
         "mov QWORD PTR [rsp + 40], r9\n"
 
-        "mov rdi, rsp\n"
-        "mov rsi, 6\n"
+        "mov rdi, r10\n"
 
         "call loggingWrapper_c\n"
 
@@ -65,8 +75,7 @@ extern "C" void asm_wrapper() {
     );
 }
 
-HookPatch::HookPatch(const std::string& functionName, LogCallback callback)
-    : functionName_(functionName) {
+HookPatch::HookPatch(LogCallback callback){
     if (callback) logCallback_ = callback;
     else logCallback_ = &HookPatch::defaultLogger;
 }
@@ -75,12 +84,11 @@ HookPatch::~HookPatch() {
     remove();
 }
 
-bool HookPatch::install() {
-    if (installed_) return true;
-
-    void* target = dlsym(RTLD_DEFAULT, functionName_.c_str());
+bool HookPatch::install(std::string functionName) {
+    functionName_ = functionName;
+    void* target = dlsym(RTLD_DEFAULT, functionName.c_str());
     if (!target) {
-        std::cerr << "dlsym failed for " << functionName_ << ": " << dlerror() << "\n";
+        std::cerr << "dlsym failed for " << functionName << ": " << dlerror() << "\n";
         return false;
     }
     originalFunction_ = target;
@@ -95,8 +103,23 @@ bool HookPatch::install() {
         std::cerr << "patchFunction failed\n";
         return false;
     }
+    
+    PatchInfo info;
+    info.originalAddress = target;
+    info.trampoline = trampoline_;
+    strcpy(info.functionName, functionName.c_str());
 
+    // сохранить stub из lastStub
+    info.stub = lastStub;
+    info.stubSize = lastStubSize;
+    printf("stub at %p, target at %p\n", lastStub, originalFunction_);
+
+    patchedFunctions[nextId] = info;
+    installedId = nextId; // сохраняем id в объекте
+    nextId++;
+    
     installed_ = true;
+    //std::cout << "Patch success! patchedFunctions.size >> " << patchedFunctions.size() << std::endl;
     return true;
 }
 
@@ -111,10 +134,7 @@ bool HookPatch::remove() {
     return true;
 }
 
-bool HookPatch::isInstalled() const { return installed_; }
-
-static inline size_t emit_abs_call(uint8_t* dst, uint64_t target)
-{
+static inline size_t emit_abs_call(uint8_t* dst, uint64_t target){
     // mov rax, imm64
     dst[0] = 0x48;
     dst[1] = 0xB8;
@@ -122,6 +142,7 @@ static inline size_t emit_abs_call(uint8_t* dst, uint64_t target)
     // call rax
     dst[10] = 0xFF;
     dst[11] = 0xD0;
+    dst[12] = 0x01;
     return 12;
 }
 
@@ -255,18 +276,45 @@ bool HookPatch::patchFunction(void* targetFunction) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(targetFunction);
     uintptr_t pageStart = addr & ~(pageSize - 1);
 
-    if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        std::cerr << "mprotect failed: " << strerror(errno) << "\n";
+    const size_t stubSize = 32;
+    void* stubMem = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (stubMem == MAP_FAILED) {
+        std::cerr << "mmap(stub) failed: " << strerror(errno) << "\n";
         return false;
     }
 
-    uint8_t* p = static_cast<uint8_t*>(targetFunction);
+    uint8_t* s = reinterpret_cast<uint8_t*>(stubMem);
+    size_t off = 0;
 
-    p[0] = 0xFF;
-    p[1] = 0x25;
-    *reinterpret_cast<int32_t*>(&p[2]) = 0;
-    g_currentHook = this;
-    *reinterpret_cast<uint64_t*>(&p[6]) = reinterpret_cast<uint64_t>(&asm_wrapper);
+    s[off++] = 0x49; s[off++] = 0xBA; // mov r10, imm64
+    *reinterpret_cast<uint64_t*>(s + off) = static_cast<uint64_t>(nextId); // вставляем id
+    off += 8;
+
+    s[off++] = 0x48; s[off++] = 0xB8; //mov rax, imm64
+    *reinterpret_cast<uint64_t*>(s + off) = reinterpret_cast<uint64_t>(&asm_wrapper);
+    off += 8;
+
+    s[off++] = 0xFF; s[off++] = 0xE0; // jmp rax
+
+    __builtin___clear_cache(reinterpret_cast<char*>(stubMem),
+                            reinterpret_cast<char*>(stubMem + off));
+
+    uint8_t patch[14] = {
+        0xFF, 0x25, //jmp QWORD PTR [RIP + 0]
+        0, 0, 0, 0,
+        0, 0, 0, 0,
+        0, 0, 0, 0
+    };
+    *reinterpret_cast<uint64_t*>(&patch[6]) = reinterpret_cast<uint64_t>(stubMem);
+
+    if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+        std::cerr << "mprotect failed: " << strerror(errno) << "\n";
+        munmap(stubMem, stubSize);
+        return false;
+    }
+
+    memcpy(targetFunction, patch, sizeof(patch));
 
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC) == -1) {
         std::cerr << "mprotect restore failed: " << strerror(errno) << "\n";
@@ -276,8 +324,12 @@ bool HookPatch::patchFunction(void* targetFunction) {
     char* origEnd = origBegin + JUMP_SIZE;
     __builtin___clear_cache(origBegin, origEnd);
 
+    lastStub = stubMem;
+    lastStubSize = stubSize;
+
     return true;
 }
+
 
 void HookPatch::restoreFunction() {
     if (!trampoline_.originalAddress || !trampoline_.code) return;

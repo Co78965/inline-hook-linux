@@ -22,31 +22,31 @@ static void safe_log(const char* prefix, const char* path) {
 
 int main() {
     // Создаём HookPatch на функцию "open"
-    HookPatch openHook("open");
-    if (!openHook.install()) {
+    HookController* hookController = HookController::GetHookController();
+    HookPatch* hookPatch = hookController->GetHookPatch();
+
+    if (!hookPatch->install("open")) {
         write(2, "Failed to install hook\n", 23);
         return 1;
     }
 
-    HookPatch hook("puts");
-
-    if (!hook.install()) {
+    if (!hookPatch->install("puts")) {
         write(2, "Failed to install hook\n", 23);
         return 1;
     }
 
-//    puts("check!");
+    puts("check!");
 
     // --- Тест 1: open + write + close (создание файла)
-    // const char* filename1 = "hook_test1.txt";
-    // int fd = open(filename1, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    // if (fd == -1) {
-    //     safe_log("[ERROR] open failed for", filename1);
-    // } else {
-    //     const char* text = "Hello from open() test\n";
-    //     write(fd, text, strlen(text));
-    //     close(fd);
-    // }
+    const char* filename1 = "hook_test1.txt";
+    int fd = open(filename1, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd == -1) {
+        safe_log("[ERROR] open failed for", filename1);
+    } else {
+        const char* text = "Hello from open() test\n";
+        write(fd, text, strlen(text));
+        close(fd);
+    }
 
     // // --- Тест 2: fopen (внутри будет вызван open)
     // const char* filename2 = "hook_test2.txt";
