@@ -1,28 +1,24 @@
-// main_open.cpp
-#include "HookPatch.hpp"
-#include <fcntl.h>      // open, O_CREAT, O_WRONLY
-#include <unistd.h>     // write, close
+#include "../HookPatch.hpp"
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <sys/stat.h>   // mode constants
+#include <sys/stat.h>
 #include <sstream>
 #include <iostream>
 
-// Вспомогательная функция для безопасного логирования в stderr (write(2))
 static void safe_log(const char* prefix, const char* path) {
     char buf[512];
     int n = snprintf(buf, sizeof(buf), "%s %s\n", prefix, path ? path : "(null)");
     if (n > 0) {
-        // write может быть тоже захвачен, но обычно безопаснее, чем printf
         ssize_t w = write(2, buf, static_cast<size_t>(n));
         (void)w;
     }
 }
 
 int main() {
-    // Создаём HookPatch на функцию "open"
-    HookController* hookController = HookController::GetHookController();
+    HookController* hookController = HookController::GetHookController(printf);
     HookPatch* hookPatch = hookController->GetHookPatch();
 
     if (!hookPatch->install("open")) {

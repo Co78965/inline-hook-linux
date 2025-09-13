@@ -3,7 +3,7 @@ CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -MMD -MP
 LDFLAGS :=
 LIBS := -ldl -lZydis
 
-SRCS := main.cpp HookPatch.cpp
+SRCS := main.cpp ../HookPatch.cpp
 OBJS := $(patsubst %.cpp,build/%.o,$(SRCS))
 DEPS := $(patsubst %.o,%.d,$(OBJS))
 

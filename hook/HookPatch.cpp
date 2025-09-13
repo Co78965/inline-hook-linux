@@ -9,35 +9,30 @@
 #include <Zydis/Zydis.h>
 #include <map>
 
+#include "../pipe/server.h"
+
 const size_t HookPatch::JUMP_SIZE = 14;
 
-thread_local HookPatch* g_currentHook = nullptr;
+SendMessageFunc HookPatch::sendMessage_ = nullptr;
 
-std::map<unsigned int, PatchInfo> patchedFunctions;
+constexpr size_t MAX_PATCHES = 64;
+static PatchInfo patchedFunctions[MAX_PATCHES];
+static unsigned int patchedCount = 0;
 
 HookController* HookController::hookController = nullptr;
 
-HookController* HookController::GetHookController() {
-    if (!hookController) {
-        hookController = new HookController(nullptr);
+void HookPatch::defaultLogger(const std::string& funcName) {
+    if (safe_log) {
+        std::string out = "[HOOK] " + funcName + "\n";
+        safe_log(out.c_str());
     }
-    return hookController;
-}
-
-HookPatch* HookController::GetHookPatch() {
-    return hookPatch;
-}
-
-void HookPatch::defaultLogger(const std::string funcName) {
-    std::cerr << "[HOOK] " << funcName << "\n";
 }
 
 extern "C" uint64_t loggingWrapper_c(unsigned int id) {
-    std::cout << id << std::endl;
     auto info = patchedFunctions[id];
-
+    std::string funcName = std::string(info.functionName);
     try {
-        HookPatch::defaultLogger(std::string(info.functionName));
+        HookPatch::defaultLogger(funcName);
     } catch (...) {
     }
 
@@ -75,63 +70,99 @@ extern "C" void asm_wrapper() {
     );
 }
 
-HookPatch::HookPatch(LogCallback callback){
-    if (callback) logCallback_ = callback;
-    else logCallback_ = &HookPatch::defaultLogger;
+HookPatch::HookPatch(LogCallback callback, SendMessageFunc send_func) {
+    // logCallback_ = callback; // Если нужно
+    // if (send_func) {
+    //     std::cerr << "check!" << std::endl;
+    //     safe_log = send_func;  // Устанавливаем статический член
+    // }
 }
 
 HookPatch::~HookPatch() {
-    remove();
+    removeAll();
 }
 
 bool HookPatch::install(std::string functionName) {
     functionName_ = functionName;
+
     void* target = dlsym(RTLD_DEFAULT, functionName.c_str());
     if (!target) {
-        std::cerr << "dlsym failed for " << functionName << ": " << dlerror() << "\n";
+        const char err[] = "dlsym failed\n";
+        safe_log(err);
         return false;
     }
     originalFunction_ = target;
 
     if (!createTrampoline(target)) {
-        std::cerr << "createTrampoline failed\n";
+        const char err[] = "createTrampoline failed\n";
+        safe_log(err);
         return false;
     }
+
     uint8_t origFirst[16];
-    memcpy(origFirst, target, 16);
+    memcpy(origFirst, target, sizeof(origFirst));
+
     if (!patchFunction(target)) {
-        std::cerr << "patchFunction failed\n";
+        const char err[] = "patchFunction failed\n";
+        safe_log(err);
         return false;
     }
-    
+
     PatchInfo info;
     info.originalAddress = target;
     info.trampoline = trampoline_;
-    strcpy(info.functionName, functionName.c_str());
+    strncpy(info.functionName, functionName.c_str(), sizeof(info.functionName)-1);
+    info.functionName[sizeof(info.functionName)-1] = '\0';
 
-    // сохранить stub из lastStub
     info.stub = lastStub;
     info.stubSize = lastStubSize;
-    printf("stub at %p, target at %p\n", lastStub, originalFunction_);
 
     patchedFunctions[nextId] = info;
-    installedId = nextId; // сохраняем id в объекте
     nextId++;
-    
-    installed_ = true;
-    //std::cout << "Patch success! patchedFunctions.size >> " << patchedFunctions.size() << std::endl;
+
+    // Финальный безопасный лог
+    const char ok[] = "Patch success (safe write)\n";
+    safe_log(ok);
+
     return true;
 }
 
-bool HookPatch::remove() {
-    if (!installed_) return true;
-    restoreFunction();
-    if (trampoline_.code) {
-        munmap(trampoline_.code, trampoline_.size);
-        trampoline_.code = nullptr;
+void HookPatch::removeAll() {
+    for (unsigned int i = 0; i < nextId; ++i) {
+        PatchInfo& info = patchedFunctions[i];
+        if (!info.originalAddress) continue;
+
+        long pageSize = sysconf(_SC_PAGESIZE);
+        uintptr_t addr = reinterpret_cast<uintptr_t>(info.originalAddress);
+        uintptr_t pageStart = addr & ~(pageSize - 1);
+
+        if (mprotect(reinterpret_cast<void*>(pageStart),
+                     pageSize,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
+            continue;
+        }
+
+        memcpy(info.originalAddress, info.trampoline.code, HookPatch::JUMP_SIZE);
+
+        mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC);
+
+        char* origBegin = reinterpret_cast<char*>(info.originalAddress);
+        char* origEnd   = origBegin + HookPatch::JUMP_SIZE;
+        __builtin___clear_cache(origBegin, origEnd);
+
+        if (info.trampoline.code) {
+            munmap(info.trampoline.code, info.trampoline.size);
+            info.trampoline.code = nullptr;
+        }
+        if (info.stub) {
+            munmap(info.stub, info.stubSize);
+            info.stub = nullptr;
+            info.stubSize = 0;
+        }
+
+        info.originalAddress = nullptr;
     }
-    installed_ = false;
-    return true;
+    nextId = 0;
 }
 
 static inline size_t emit_abs_call(uint8_t* dst, uint64_t target){
@@ -153,7 +184,6 @@ bool HookPatch::createTrampoline(void* targetFunction) {
     void* mem = mmap(nullptr, maxTramp, PROT_READ | PROT_WRITE | PROT_EXEC,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        std::cerr << "mmap failed: " << strerror(errno) << "\n";
         return false;
     }
     uint8_t* tramp = static_cast<uint8_t*>(mem);
@@ -161,7 +191,7 @@ bool HookPatch::createTrampoline(void* targetFunction) {
 
     ZydisDecoder decoder;
     if (ZYAN_STATUS_SUCCESS != ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) {
-        std::cerr << "ZydisDecoderInit failed\n";
+        safe_log("ZydisDecoderInit failed\n");
         munmap(tramp, maxTramp);
         return false;
     }
@@ -189,14 +219,14 @@ bool HookPatch::createTrampoline(void* targetFunction) {
             operands);
 
         if (st != ZYAN_STATUS_SUCCESS) {
-            std::cerr << "Zydis failed to decode at " << static_cast<void*>(src_base + prefix_skip + copied) << "\n";
+            safe_log("Zydis failed to decode"); // + static_cast<void*>(src_base + prefix_skip + copied) + "\n");
             munmap(tramp, maxTramp);
             return false;
         }
 
         uint8_t ilen = instr.length;
         if (ilen == 0) {
-            std::cerr << "Zydis returned zero-length instruction\n";
+            safe_log("Zydis returned zero-length instruction\n");
             munmap(tramp, maxTramp);
             return false;
         }
@@ -205,9 +235,9 @@ bool HookPatch::createTrampoline(void* targetFunction) {
             const ZydisDecodedOperand& op = operands[opIndex];
             if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
                 if (op.mem.base == ZYDIS_REGISTER_RIP) {
-                    std::cerr << "createTrampoline: found RIP-relative memory operand at "
-                              << static_cast<void*>(src_base + prefix_skip + copied)
-                              << " — refusing to patch (safe fallback). Use relocation if needed.\n";
+                    // safe_log("createTrampoline: found RIP-relative memory operand at "
+                    //           + static_cast<void*>(src_base + prefix_skip + copied)
+                    //           + " — refusing to patch (safe fallback). Use relocation if needed.\n");
                     munmap(tramp, maxTramp);
                     return false;
                 }
@@ -224,7 +254,7 @@ bool HookPatch::createTrampoline(void* targetFunction) {
                     uint64_t abs_target = instr_addr + ilen + rel;
 
                     if (tramp_off + 12 + 32 >= maxTramp) {
-                        std::cerr << "trampoline buffer too small for abs-call\n";
+                        safe_log("trampoline buffer too small for abs-call\n");
                         munmap(tramp, maxTramp);
                         return false;
                     }
@@ -242,7 +272,7 @@ bool HookPatch::createTrampoline(void* targetFunction) {
         }
 
         if (tramp_off + ilen + 32 >= maxTramp) {
-            std::cerr << "trampoline buffer too small\n";
+            safe_log("trampoline buffer too small\n");
             munmap(tramp, maxTramp);
             return false;
         }
@@ -252,7 +282,7 @@ bool HookPatch::createTrampoline(void* targetFunction) {
     }
 
     if (tramp_off + 14 >= maxTramp) {
-        std::cerr << "trampoline buffer too small for final jmp\n";
+        safe_log("trampoline buffer too small for final jmp\n");
         munmap(tramp, maxTramp);
         return false;
     }
@@ -280,7 +310,7 @@ bool HookPatch::patchFunction(void* targetFunction) {
     void* stubMem = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stubMem == MAP_FAILED) {
-        std::cerr << "mmap(stub) failed: " << strerror(errno) << "\n";
+        //safe_log("mmap(stub) failed: " + strerror(errno) + "\n");
         return false;
     }
 
@@ -309,7 +339,7 @@ bool HookPatch::patchFunction(void* targetFunction) {
     *reinterpret_cast<uint64_t*>(&patch[6]) = reinterpret_cast<uint64_t>(stubMem);
 
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        std::cerr << "mprotect failed: " << strerror(errno) << "\n";
+        //safe_log("mprotect failed: " + strerror(errno) + "\n");
         munmap(stubMem, stubSize);
         return false;
     }
@@ -317,7 +347,7 @@ bool HookPatch::patchFunction(void* targetFunction) {
     memcpy(targetFunction, patch, sizeof(patch));
 
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC) == -1) {
-        std::cerr << "mprotect restore failed: " << strerror(errno) << "\n";
+        //safe_log("mprotect restore failed: " + strerror(errno) + "\n");
     }
 
     char* origBegin = reinterpret_cast<char*>(targetFunction);
@@ -338,14 +368,14 @@ void HookPatch::restoreFunction() {
     uintptr_t addr = reinterpret_cast<uintptr_t>(trampoline_.originalAddress);
     uintptr_t pageStart = addr & ~(pageSize - 1);
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        std::cerr << "mprotect restore failed: " << strerror(errno) << "\n";
+        //safe_log("mprotect restore failed: " + strerror(errno) + "\n");
         return;
     }
 
     memcpy(trampoline_.originalAddress, trampoline_.code, JUMP_SIZE);
 
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC) == -1) {
-        std::cerr << "mprotect restore2 failed: " << strerror(errno) << "\n";
+        //safe_log("mprotect restore2 failed: " + strerror(errno) + "\n");
     }
     char* origBegin = reinterpret_cast<char*>(trampoline_.originalAddress);
     char* origEnd = origBegin + JUMP_SIZE;
