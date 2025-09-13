@@ -4,15 +4,24 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <dirent.h>
 #include <cstdint>
 #include <climits>
+
+#define MAX_PATCHES (64)
 
 extern "C" uint64_t loggingWrapper_c(unsigned int id);
 extern "C" void asm_wrapper() __attribute__((naked));
 
-extern std::wstring hiddenFile;
 using LogCallback = std::function<void(const std::string)>;
 using SendMessageFunc = std::function<void(const char*)>;
+using open_f     = int(*)(const char*, int, ...);
+using openat_f   = int(*)(int, const char*, int, ...);
+using readdir_f  = struct dirent*(*)(DIR*);
+
+static open_f orig_open = nullptr;
+static openat_f orig_openat = nullptr;
+static readdir_f orig_readdir = nullptr;
 
 enum HookMode
 { 
@@ -36,15 +45,19 @@ struct PatchInfo {
     size_t stubSize;
 };
 
+static PatchInfo patchedFunctions[MAX_PATCHES];
+static std::string hiddenFile; // = "/home/ivan/projects/trspo/lab_1_dop/secret.txt";
+
 class HookPatch {
 public:
-    static const size_t JUMP_SIZE;
+    static const size_t JUMP_SIZE = 14;
 
     HookPatch(LogCallback callback = nullptr, SendMessageFunc send_func = nullptr);
     ~HookPatch();
 
-    bool install(std::string functionName);
+    bool install(std::string functionName, HookMode mode);
     void removeAll();
+    void setHiddenFile(std::string file);
 
     HookPatch(const HookPatch&) = delete;
     HookPatch& operator=(const HookPatch&) = delete;

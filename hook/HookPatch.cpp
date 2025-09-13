@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <cstring>
 #include <iostream>
 #include <cerrno>
@@ -11,26 +12,78 @@
 
 #include "../pipe/server.h"
 
-const size_t HookPatch::JUMP_SIZE = 14;
-
 SendMessageFunc HookPatch::sendMessage_ = nullptr;
-
-constexpr size_t MAX_PATCHES = 64;
-static PatchInfo patchedFunctions[MAX_PATCHES];
-static unsigned int patchedCount = 0;
-
 HookController* HookController::hookController = nullptr;
 
-void HookPatch::defaultLogger(const std::string& funcName) {
-    if (safe_log) {
-        std::string out = "[HOOK] " + funcName + "\n";
-        safe_log(out.c_str());
+extern "C" int Hide_open(const char* pathname, int flags, ...) {
+    if (!orig_open) orig_open = (open_f)dlsym(RTLD_NEXT, "open");
+
+    std::string fname = pathname ? pathname : "";
+
+    if (fname == hiddenFile) {
+        safe_log("open | file is hide\n");
+        errno = ENOENT;
+        return -1;
     }
+
+    va_list args;
+    va_start(args, flags);
+    mode_t mode = va_arg(args, int);
+    va_end(args);
+
+    return orig_open(pathname, flags, mode);
+}
+
+extern "C" int Hide_openat(int dirfd, const char* pathname, int flags, ...) {
+    if (!orig_openat) orig_openat = (openat_f)dlsym(RTLD_NEXT, "openat");
+
+    std::string fname = pathname ? pathname : "";
+
+    if (fname == hiddenFile) {
+        safe_log("openat | file is hide\n");
+        errno = ENOENT;
+        return -1;
+    }
+
+    va_list args;
+    va_start(args, flags);
+    mode_t mode = va_arg(args, int);
+    va_end(args);
+
+    return orig_openat(dirfd, pathname, flags, mode);
+}
+
+extern "C" struct dirent* Hide_readdir(DIR* dirp) {
+    if (!orig_readdir) orig_readdir = (readdir_f)dlsym(RTLD_NEXT, "readdir");
+
+    struct dirent* entry;
+    while ((entry = orig_readdir(dirp)) != nullptr) {
+        if (entry->d_name && hiddenFile == entry->d_name){
+            safe_log("readdir | file is hide\n");
+            continue;
+        }
+        return entry;
+    }
+    return nullptr;
+}
+
+void HookPatch::defaultLogger(const std::string& funcName) {
+    std::string out = "[HOOK] " + funcName + "\n";
+    safe_log(out.c_str());
 }
 
 extern "C" uint64_t loggingWrapper_c(unsigned int id) {
     auto info = patchedFunctions[id];
     std::string funcName = std::string(info.functionName);
+    if (info.mode == HIDE_FILE) {
+    if (strcmp(info.functionName, "open") == 0)
+        return (long long)Hide_open;
+    if (strcmp(info.functionName, "openat") == 0)
+        return (long long)Hide_openat;
+    if (strcmp(info.functionName, "readdir") == 0)
+        return (long long)Hide_readdir;
+    }
+    
     try {
         HookPatch::defaultLogger(funcName);
     } catch (...) {
@@ -70,19 +123,15 @@ extern "C" void asm_wrapper() {
     );
 }
 
-HookPatch::HookPatch(LogCallback callback, SendMessageFunc send_func) {
-    // logCallback_ = callback; // Если нужно
-    // if (send_func) {
-    //     std::cerr << "check!" << std::endl;
-    //     safe_log = send_func;  // Устанавливаем статический член
-    // }
-}
+void HookPatch::setHiddenFile(std::string file){ hiddenFile = file;  safe_log(hiddenFile.c_str());}
+
+HookPatch::HookPatch(LogCallback callback, SendMessageFunc send_func) { }
 
 HookPatch::~HookPatch() {
     removeAll();
 }
 
-bool HookPatch::install(std::string functionName) {
+bool HookPatch::install(std::string functionName, HookMode mode) {
     functionName_ = functionName;
 
     void* target = dlsym(RTLD_DEFAULT, functionName.c_str());
@@ -116,11 +165,11 @@ bool HookPatch::install(std::string functionName) {
 
     info.stub = lastStub;
     info.stubSize = lastStubSize;
+    info.mode = mode;
 
     patchedFunctions[nextId] = info;
     nextId++;
 
-    // Финальный безопасный лог
     const char ok[] = "Patch success (safe write)\n";
     safe_log(ok);
 
@@ -235,9 +284,6 @@ bool HookPatch::createTrampoline(void* targetFunction) {
             const ZydisDecodedOperand& op = operands[opIndex];
             if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
                 if (op.mem.base == ZYDIS_REGISTER_RIP) {
-                    // safe_log("createTrampoline: found RIP-relative memory operand at "
-                    //           + static_cast<void*>(src_base + prefix_skip + copied)
-                    //           + " — refusing to patch (safe fallback). Use relocation if needed.\n");
                     munmap(tramp, maxTramp);
                     return false;
                 }
@@ -310,7 +356,6 @@ bool HookPatch::patchFunction(void* targetFunction) {
     void* stubMem = mmap(nullptr, stubSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stubMem == MAP_FAILED) {
-        //safe_log("mmap(stub) failed: " + strerror(errno) + "\n");
         return false;
     }
 
@@ -339,16 +384,12 @@ bool HookPatch::patchFunction(void* targetFunction) {
     *reinterpret_cast<uint64_t*>(&patch[6]) = reinterpret_cast<uint64_t>(stubMem);
 
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        //safe_log("mprotect failed: " + strerror(errno) + "\n");
         munmap(stubMem, stubSize);
         return false;
     }
 
     memcpy(targetFunction, patch, sizeof(patch));
-
-    if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC) == -1) {
-        //safe_log("mprotect restore failed: " + strerror(errno) + "\n");
-    }
+    mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC);
 
     char* origBegin = reinterpret_cast<char*>(targetFunction);
     char* origEnd = origBegin + JUMP_SIZE;
@@ -360,7 +401,6 @@ bool HookPatch::patchFunction(void* targetFunction) {
     return true;
 }
 
-
 void HookPatch::restoreFunction() {
     if (!trampoline_.originalAddress || !trampoline_.code) return;
 
@@ -368,15 +408,12 @@ void HookPatch::restoreFunction() {
     uintptr_t addr = reinterpret_cast<uintptr_t>(trampoline_.originalAddress);
     uintptr_t pageStart = addr & ~(pageSize - 1);
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_WRITE | PROT_EXEC) == -1) {
-        //safe_log("mprotect restore failed: " + strerror(errno) + "\n");
         return;
     }
 
     memcpy(trampoline_.originalAddress, trampoline_.code, JUMP_SIZE);
-
-    if (mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC) == -1) {
-        //safe_log("mprotect restore2 failed: " + strerror(errno) + "\n");
-    }
+    mprotect(reinterpret_cast<void*>(pageStart), pageSize, PROT_READ | PROT_EXEC);
+    
     char* origBegin = reinterpret_cast<char*>(trampoline_.originalAddress);
     char* origEnd = origBegin + JUMP_SIZE;
     __builtin___clear_cache(origBegin, origEnd);
